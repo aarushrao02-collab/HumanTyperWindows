@@ -12,8 +12,8 @@ let savedState = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 420,
-    height: 600,
+    width: 460,
+    height: 760,
     resizable: false,
     frame: false,
     transparent: false,
@@ -58,11 +58,21 @@ ipcMain.on('stop-typing', () => {
   stopRequested = true;
 });
 
-async function doTyping(event, { text, wpm, useTypos }, startIndex) {
+async function doTyping(event, payload, startIndex) {
   isTyping = true;
   stopRequested = false;
 
-  const baseDelay = 60000 / (wpm * 5);
+  const {
+    text,
+    wpm,
+    targetSeconds,
+    useTypos,
+    typoPercent,
+    useHesitation,
+    hesitationMin,
+    hesitationMax,
+    hesitationChance
+  } = normalizePayload(payload);
 
   const adjacentKeys = {
     'a': ['s', 'q', 'z'], 'b': ['v', 'n', 'g'], 'c': ['x', 'v', 'd'],
@@ -77,6 +87,11 @@ async function doTyping(event, { text, wpm, useTypos }, startIndex) {
   };
 
   const chars = text.split('');
+  const typoRate = useTypos ? typoPercent / 100 : 0;
+  const baseDelay = getBaseDelay(chars, wpm, targetSeconds);
+  const remainingRatio = chars.length ? (chars.length - startIndex) / chars.length : 1;
+  const remainingBudgetMs = targetSeconds > 0 ? targetSeconds * 1000 * remainingRatio : 0;
+  const deadline = remainingBudgetMs > 0 ? Date.now() + remainingBudgetMs : 0;
 
   for (let i = startIndex; i < chars.length; i++) {
     if (stopRequested) {
@@ -87,12 +102,24 @@ async function doTyping(event, { text, wpm, useTypos }, startIndex) {
     const char = chars[i];
     const lowerChar = char.toLowerCase();
 
-    if (useTypos && Math.random() < 0.03 && adjacentKeys[lowerChar]) {
+    if (Math.random() < typoRate && adjacentKeys[lowerChar]) {
       const wrongKey = adjacentKeys[lowerChar][Math.floor(Math.random() * adjacentKeys[lowerChar].length)];
       await typeChar(wrongKey);
-      await wait(baseDelay * 2.5);
+      await waitWithinLimit(baseDelay * 2.5, deadline, chars.length - i);
       await keyboard.type(Key.Backspace);
-      await wait(baseDelay * 1.5);
+      await waitWithinLimit(baseDelay * 1.5, deadline, chars.length - i);
+    }
+
+    if (useHesitation && shouldHesitate(char, chars[i - 1], hesitationChance)) {
+      const hesitationDelay = getLimitedWaitMs(
+        randomBetween(hesitationMin, hesitationMax),
+        deadline,
+        chars.length - i
+      );
+      if (hesitationDelay >= 50) {
+        event.reply('hesitation', { durationMs: Math.round(hesitationDelay) });
+      }
+      await wait(hesitationDelay);
     }
 
     await typeChar(char);
@@ -110,7 +137,7 @@ async function doTyping(event, { text, wpm, useTypos }, startIndex) {
     });
 
     const jitter = baseDelay * (0.8 + Math.random() * 0.4);
-    await wait(jitter + extra);
+    await waitWithinLimit(jitter + extra, deadline, chars.length - i - 1);
   }
 
   isTyping = false;
@@ -135,4 +162,64 @@ async function typeChar(char) {
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizePayload(payload) {
+  return {
+    text: String(payload.text || ''),
+    wpm: clampNumber(payload.wpm, 10, 300, 60),
+    targetSeconds: clampNumber(payload.targetSeconds, 0, 86400, 0),
+    useTypos: Boolean(payload.useTypos),
+    typoPercent: clampNumber(payload.typoPercent, 0, 100, 3),
+    useHesitation: Boolean(payload.useHesitation),
+    hesitationMin: clampNumber(payload.hesitationMin, 1, 10000, 250),
+    hesitationMax: clampNumber(payload.hesitationMax, 1, 10000, 1200),
+    hesitationChance: clampNumber(payload.hesitationChance, 0, 100, 8)
+  };
+}
+
+function getBaseDelay(chars, wpm, targetSeconds) {
+  const wpmDelay = 60000 / (wpm * 5);
+  if (!targetSeconds || !chars.length) return wpmDelay;
+
+  const estimatedWeight = chars.reduce((total, char) => {
+    if (char === '\n') return total + 5;
+    if (/[.!?]/.test(char)) return total + 4;
+    if (char === ',') return total + 2.2;
+    if (char === ' ') return total + 1.8;
+    return total + 1;
+  }, 0);
+
+  return Math.max(1, Math.min(wpmDelay, (targetSeconds * 1000) / estimatedWeight));
+}
+
+function shouldHesitate(char, previousChar, hesitationChance) {
+  const baseChance = hesitationChance / 100;
+  if (baseChance <= 0) return false;
+  if (/[.!?]/.test(previousChar || '')) return Math.random() < Math.max(baseChance, 0.35);
+  if (char === ' ') return Math.random() < Math.max(baseChance, 0.08);
+  return Math.random() < baseChance;
+}
+
+async function waitWithinLimit(desiredMs, deadline, remainingChars) {
+  await wait(getLimitedWaitMs(desiredMs, deadline, remainingChars));
+}
+
+function getLimitedWaitMs(desiredMs, deadline, remainingChars) {
+  if (!deadline) return Math.max(0, desiredMs);
+
+  const remainingMs = deadline - Date.now();
+  const reserveMs = Math.max(0, remainingChars) * 2;
+  const allowedMs = Math.max(0, remainingMs - reserveMs);
+  return Math.min(Math.max(0, desiredMs), allowedMs);
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+function clampNumber(value, min, max, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
 }
